@@ -1,0 +1,446 @@
+import os, re, math, random, glob
+import numpy as np
+import pandas as pd
+from PIL import Image
+import xml.etree.ElementTree as ET
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+import timm
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+from sklearn.model_selection import KFold
+
+class CFG:
+    seed = 42
+
+    img_size = 512
+    hm_size  = 128
+    sigma = 2.5
+
+    roi_crop_p = 0.70
+    roi_scale_range = (1.4, 2.6)
+
+    backbone = "resnet34"
+    out_indices = (1,2,3,4)
+
+    folds = 5
+    epochs = 25
+    batch_size = 4
+    lr = 2e-4
+    weight_decay = 1e-4
+    num_workers = 2
+
+    amp = True
+    tta_hflip = True
+
+    # 不可见点阈值：如果热力图置信度太低就输出 (0,0)
+    vis_th = -1.0
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+set_seed(CFG.seed)
+
+# ====== 路径（你现在的数据集就是这个）======
+DATA_ROOT = "/kaggle/input/mltask4"
+TRAIN_IMG_DIR = os.path.join(DATA_ROOT, "detection", "train")
+TEST_IMG_DIR  = os.path.join(DATA_ROOT, "detection", "test")
+XML_DIR       = os.path.join(DATA_ROOT, "detection", "train_location")
+GT_PATH       = os.path.join(DATA_ROOT, "detection", "fovea_localization_train_GT.csv")
+SAMPLE_SUB    = os.path.join(DATA_ROOT, "detection", "sample_submission.csv")
+
+print("DATA_ROOT:", DATA_ROOT)
+print("Train images:", len(glob.glob(os.path.join(TRAIN_IMG_DIR, "*.jpg"))))
+print("Test images :", len(glob.glob(os.path.join(TEST_IMG_DIR, "*.jpg"))))
+print("GT exists   :", os.path.exists(GT_PATH))
+print("XML dir     :", os.path.exists(XML_DIR))
+def read_bbox(xml_path):
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    box = root.find(".//bndbox")
+    if box is None:
+        return None
+    xmin = int(float(box.find("xmin").text))
+    ymin = int(float(box.find("ymin").text))
+    xmax = int(float(box.find("xmax").text))
+    ymax = int(float(box.find("ymax").text))
+    return xmin, ymin, xmax, ymax
+
+def make_heatmap(x, y, H, W, sigma):
+    # (0,0) 视作不可见，热力图全 0
+    if x <= 0 and y <= 0:
+        return np.zeros((H, W), dtype=np.float32)
+    xx, yy = np.meshgrid(np.arange(W), np.arange(H))
+    g = np.exp(-((xx - x)**2 + (yy - y)**2) / (2 * sigma * sigma))
+    g = g / (g.max() + 1e-6)
+    return g.astype(np.float32)
+
+def soft_argmax_2d(logits):
+    """
+    logits: (B,1,H,W)
+    return: (B,2) -> (x,y) in heatmap coord
+    """
+    B, C, H, W = logits.shape
+    x = logits.view(B, -1)
+    x = torch.softmax(x, dim=1)
+
+    xs = torch.linspace(0, W - 1, W, device=logits.device)
+    ys = torch.linspace(0, H - 1, H, device=logits.device)
+    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+    xx = xx.reshape(-1)
+    yy = yy.reshape(-1)
+
+    ex = (x * xx).sum(dim=1)
+    ey = (x * yy).sum(dim=1)
+    return torch.stack([ex, ey], dim=1)
+
+def hm_to_input(x_hm, y_hm):
+    # hm -> 512 输入坐标
+    scale = CFG.img_size / CFG.hm_size
+    return x_hm * scale, y_hm * scale
+
+def input_to_orig(x_in, y_in, H0, W0):
+    # 512输入坐标 -> 原图坐标（valid/test 都是只 resize，不做 ROI crop）
+    x0 = x_in * (W0 / CFG.img_size)
+    y0 = y_in * (H0 / CFG.img_size)
+    return x0, y0
+train_tfms = A.Compose([
+    A.Resize(CFG.img_size, CFG.img_size),
+    A.ShiftScaleRotate(shift_limit=0.04, scale_limit=0.12, rotate_limit=20, p=0.85, border_mode=0),
+    A.RandomBrightnessContrast(p=0.50),
+    A.HueSaturationValue(p=0.30),
+    A.GaussianBlur(blur_limit=3, p=0.20),
+    A.Normalize(),
+    ToTensorV2(),
+], keypoint_params=A.KeypointParams(format="xy", remove_invisible=False))
+
+valid_tfms = A.Compose([
+    A.Resize(CFG.img_size, CFG.img_size),
+    A.Normalize(),
+    ToTensorV2(),
+], keypoint_params=A.KeypointParams(format="xy", remove_invisible=False))
+
+test_tfms = A.Compose([
+    A.Resize(CFG.img_size, CFG.img_size),
+    A.Normalize(),
+    ToTensorV2(),
+])
+
+class FoveaTrainDataset(Dataset):
+    def __init__(self, df, transform_full, use_roi=True):
+        self.df = df.reset_index(drop=True)
+        self.t_full = transform_full
+        self.use_roi = use_roi
+
+    def __len__(self):
+        return len(self.df)
+
+    def _roi_crop(self, img, x, y, bbox):
+        H, W = img.shape[:2]
+        xmin, ymin, xmax, ymax = bbox
+        bw = max(1, xmax - xmin)
+        bh = max(1, ymax - ymin)
+
+        cx = (xmin + xmax) / 2.0
+        cy = (ymin + ymax) / 2.0
+        scale = random.uniform(*CFG.roi_scale_range)
+        side = max(bw, bh) * scale
+
+        cx += random.uniform(-0.10, 0.10) * side
+        cy += random.uniform(-0.10, 0.10) * side
+
+        x1 = int(round(cx - side / 2))
+        y1 = int(round(cy - side / 2))
+        x2 = int(round(cx + side / 2))
+        y2 = int(round(cy + side / 2))
+
+        x1c, y1c = max(0, x1), max(0, y1)
+        x2c, y2c = min(W, x2), min(H, y2)
+
+        if (x2c - x1c) < 16 or (y2c - y1c) < 16:
+            return img, x, y
+
+        cropped = img[y1c:y2c, x1c:x2c].copy()
+        return cropped, x - x1c, y - y1c
+
+    def __getitem__(self, i):
+        r = self.df.iloc[i]
+        idx = int(r["data"])
+        x = float(r["Fovea_X"])
+        y = float(r["Fovea_Y"])
+
+        img_path = os.path.join(TRAIN_IMG_DIR, f"{idx:04d}.jpg")
+        img = np.array(Image.open(img_path).convert("RGB"))
+        H0, W0 = img.shape[:2]
+
+        # 只在训练用 ROI crop，valid 用 use_roi=False
+        if self.use_roi and random.random() < CFG.roi_crop_p:
+            xml_path = os.path.join(XML_DIR, f"{idx:04d}.xml")
+            if os.path.exists(xml_path):
+                bbox = read_bbox(xml_path)
+                if bbox is not None:
+                    img, x, y = self._roi_crop(img, x, y, bbox)
+
+        out = self.t_full(image=img, keypoints=[(x, y)])
+        img_t = out["image"]
+        x2, y2 = out["keypoints"][0]
+
+        x_hm = x2 * (CFG.hm_size / CFG.img_size)
+        y_hm = y2 * (CFG.hm_size / CFG.img_size)
+
+        hm = make_heatmap(x_hm, y_hm, CFG.hm_size, CFG.hm_size, CFG.sigma)
+        hm_t = torch.from_numpy(hm).unsqueeze(0)
+
+        xy_t = torch.tensor([x_hm, y_hm], dtype=torch.float32)
+
+        # ✅ 关键：不要 orig_hw，拆成 orig_h/orig_w（避免你之前那个报错）
+        meta = {"idx": idx, "orig_h": H0, "orig_w": W0}
+        return img_t, hm_t, xy_t, meta
+
+class FoveaTestDataset(Dataset):
+    def __init__(self, transform):
+        self.transform = transform
+        files = sorted([f for f in os.listdir(TEST_IMG_DIR) if f.lower().endswith(".jpg")])
+        self.items = []
+        for f in files:
+            idx = int(os.path.splitext(f)[0])  # "0081" -> 81
+            self.items.append((idx, os.path.join(TEST_IMG_DIR, f)))
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, i):
+        idx, path = self.items[i]
+        img = np.array(Image.open(path).convert("RGB"))
+        H0, W0 = img.shape[:2]
+        out = self.transform(image=img)
+        meta = {"idx": idx, "orig_h": H0, "orig_w": W0}
+        return out["image"], meta
+
+print("OK: train_tfms/valid_tfms/test_tfms + Datasets are ready")
+class UNetKeypoint(nn.Module):
+    def __init__(self, backbone="resnet34", out_indices=(1,2,3,4), hm_size=128, mid_ch=128):
+        super().__init__()
+        self.hm_size = hm_size
+        self.backbone = timm.create_model(
+            backbone, pretrained=True, features_only=True, out_indices=out_indices
+        )
+        chs = self.backbone.feature_info.channels()  # e.g. [64,128,256,512]
+
+        self.lats = nn.ModuleList([nn.Conv2d(c, mid_ch, 1) for c in chs])
+        self.head = nn.Sequential(
+            nn.Conv2d(mid_ch, mid_ch, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_ch, 1, 1)
+        )
+
+    def forward(self, x):
+        feats = self.backbone(x)  # list of feature maps
+        # 将所有层都上采样到 stride=4 的分辨率（对 512 输入就是 128）
+        target_h = self.hm_size
+        target_w = self.hm_size
+
+        fused = None
+        for f, lat in zip(feats, self.lats):
+            z = lat(f)
+            z = F.interpolate(z, size=(target_h, target_w), mode="bilinear", align_corners=False)
+            fused = z if fused is None else (fused + z)
+
+        logits = self.head(fused)  # (B,1,128,128)
+        return logits
+
+# quick check
+model = UNetKeypoint(CFG.backbone, CFG.out_indices, CFG.hm_size).to(CFG.device)
+x = torch.randn(2,3,CFG.img_size,CFG.img_size).to(CFG.device)
+y = model(x)
+print("model out:", y.shape)
+print("Set folds/epochs:", CFG.folds, CFG.epochs)
+df = pd.read_csv(GT_PATH)
+print(df.head())
+
+bce = nn.BCEWithLogitsLoss()
+huber = nn.SmoothL1Loss()
+
+scaler = torch.cuda.amp.GradScaler(enabled=(CFG.amp and CFG.device=="cuda"))
+
+def submission_like_mse(x_pred, y_pred, x_gt, y_gt):
+    return 0.5 * ((x_pred - x_gt)**2 + (y_pred - y_gt)**2)
+
+def train_one_fold(fold, tr_idx, va_idx):
+    tr_df = df.iloc[tr_idx].copy()
+    va_df = df.iloc[va_idx].copy()
+
+    train_ds = FoveaTrainDataset(tr_df, transform_full=train_tfms, use_roi=True)
+    valid_ds = FoveaTrainDataset(va_df, transform_full=valid_tfms, use_roi=False)
+
+    train_loader = DataLoader(train_ds, batch_size=CFG.batch_size, shuffle=True,
+                              num_workers=CFG.num_workers, pin_memory=True, drop_last=True)
+    valid_loader = DataLoader(valid_ds, batch_size=1, shuffle=False,
+                              num_workers=CFG.num_workers, pin_memory=True)
+
+    model = UNetKeypoint(CFG.backbone, CFG.out_indices, CFG.hm_size).to(CFG.device)
+    opt = torch.optim.AdamW(model.parameters(), lr=CFG.lr, weight_decay=CFG.weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=CFG.epochs)
+
+    best = 1e18
+    best_path = f"best_fold{fold}.pth"
+
+    for epoch in range(CFG.epochs):
+        model.train()
+        tr_losses = []
+
+        for img, hm_gt, xy_gt, meta in train_loader:
+            img = img.to(CFG.device)
+            hm_gt = hm_gt.to(CFG.device)
+            xy_gt = xy_gt.to(CFG.device)
+
+            opt.zero_grad(set_to_none=True)
+
+            with torch.cuda.amp.autocast(enabled=(CFG.amp and CFG.device=="cuda")):
+                logits = model(img)
+                loss_hm = bce(logits, hm_gt)
+                xy_pred = soft_argmax_2d(logits)
+                loss_xy = huber(xy_pred, xy_gt)
+                loss = loss_hm + 0.2 * loss_xy
+
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+            tr_losses.append(loss.item())
+
+        # validate
+        model.eval()
+        val_mses = []
+        with torch.no_grad():
+            for img, hm_gt, xy_gt, meta in valid_loader:
+                img = img.to(CFG.device)
+                logits = model(img)
+
+                # 置信度：max sigmoid
+                conf = torch.sigmoid(logits).max().item()
+
+                xy_hm = soft_argmax_2d(logits)[0].cpu().numpy()
+                x_in = xy_hm[0] * (CFG.img_size / CFG.hm_size)
+                y_in = xy_hm[1] * (CFG.img_size / CFG.hm_size)
+
+                H0 = int(meta["orig_h"][0].item())
+                W0 = int(meta["orig_w"][0].item())
+
+                if conf < CFG.vis_th:
+                    x_pred, y_pred = 0.0, 0.0
+                else:
+                    x_pred, y_pred = input_to_orig(x_in, y_in, H0, W0)
+
+                idx = int(meta["idx"][0].item())
+                row = va_df[va_df["data"] == idx].iloc[0]
+                x_gt = float(row["Fovea_X"])
+                y_gt = float(row["Fovea_Y"])
+
+                val_mses.append(submission_like_mse(x_pred, y_pred, x_gt, y_gt))
+
+        val_score = float(np.mean(val_mses))
+        tr_loss = float(np.mean(tr_losses))
+        print(f"[Fold {fold}] Epoch {epoch+1:02d}/{CFG.epochs}  train_loss={tr_loss:.5f}  val_mse={val_score:.5f}")
+
+        if val_score < best:
+            best = val_score
+            torch.save(model.state_dict(), best_path)
+            print(f"  -> saved {best_path}")
+
+        scheduler.step()
+
+    return best_path
+
+kf = KFold(n_splits=CFG.folds, shuffle=True, random_state=CFG.seed)
+best_paths = []
+for fold, (tr_idx, va_idx) in enumerate(kf.split(df), 1):
+    best_paths.append(train_one_fold(fold, tr_idx, va_idx))
+
+print("Best checkpoints:", best_paths)
+def infer_one_model(model, img_t):
+    logits = model(img_t)
+    conf = torch.sigmoid(logits).max().item()
+    xy_hm = soft_argmax_2d(logits)[0].detach().cpu().numpy()
+    return xy_hm, conf
+
+def hflip_tensor(img_t):
+    return torch.flip(img_t, dims=[3])
+
+test_ds = FoveaTestDataset(test_tfms)
+test_loader = DataLoader(test_ds, batch_size=1, shuffle=False,
+                         num_workers=CFG.num_workers, pin_memory=True)
+
+# load all folds
+models = []
+for p in best_paths:
+    state = torch.load(p, map_location=CFG.device)  # 现在直接是 state_dict
+    m = UNetKeypoint(CFG.backbone, CFG.out_indices, CFG.hm_size).to(CFG.device)
+    m.load_state_dict(state)
+    m.eval()
+    models.append(m)
+
+
+pred = {}
+
+with torch.no_grad():
+    for img_t, meta in test_loader:
+        img_t = img_t.to(CFG.device)
+        idx = int(meta["idx"][0].item())
+        H0 = int(meta["orig_h"][0].item())
+        W0 = int(meta["orig_w"][0].item())
+
+        xy_acc = []
+        confs = []
+
+        for m in models:
+            xy1, c1 = infer_one_model(m, img_t)
+            xy_acc.append(xy1); confs.append(c1)
+
+            if CFG.tta_hflip:
+                img_f = hflip_tensor(img_t)
+                xy2, c2 = infer_one_model(m, img_f)
+                xy2[0] = (CFG.hm_size - 1) - xy2[0]
+                xy_acc.append(xy2); confs.append(c2)
+
+        xy_mean = np.mean(np.stack(xy_acc, axis=0), axis=0)
+        conf_mean = float(np.mean(confs))
+
+        if conf_mean < CFG.vis_th:
+            x0, y0 = 0.0, 0.0
+        else:
+            x_in = xy_mean[0] * (CFG.img_size / CFG.hm_size)
+            y_in = xy_mean[1] * (CFG.img_size / CFG.hm_size)
+            x0, y0 = input_to_orig(x_in, y_in, H0, W0)
+
+        pred[idx] = (float(x0), float(y0))
+
+# write submission
+sub = pd.read_csv(SAMPLE_SUB)
+
+def parse_imageid(s):
+    m = re.match(r"(\d+)_Fovea_(X|Y)", str(s))
+    if m is None:
+        raise ValueError(f"Unexpected ImageID format: {s}")
+    return int(m.group(1)), m.group(2)
+
+values = []
+for imageid in sub["ImageID"].values:
+    id_num, axis = parse_imageid(imageid)
+    x, y = pred[id_num]
+    values.append(x if axis=="X" else y)
+
+sub["value"] = values
+sub.to_csv("submission.csv", index=False)
+print("Saved: /kaggle/working/submission.csv")
+sub.head(10)
